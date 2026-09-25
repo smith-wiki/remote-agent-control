@@ -1,0 +1,21 @@
+# Mirror the same tmux session into Zulip; do not move the agent into chat
+
+The operator starts several interactive OMP TUIs at the desk, then wants to read their progress and answer **those same agents** from a phone. A separate chat agent with another conversation would not meet this requirement.
+
+**[PROPOSAL] Local-first topology:**
+
+```text
+Zulip phone ↔ Zulip server ↔ local bot/bridge ↔ local IPC ↔ OMP extension in each live TUI
+                                                             ↕
+                                                       existing tmux pane
+```
+
+The bot receives Zulip messages by outbound long polling and sends replies by HTTPS, so the phone needs no direct laptop connection ([event queue](https://zulip.com/api/register-queue), [send message](https://zulip.com/api/send-message)). The extension is loaded **inside** each OMP TUI; it observes message, tool and session lifecycle events and submits a real user turn into that session with `pi.sendUserMessage()`. `deliverAs: "followUp"` waits behind a busy turn; `"steer"` interrupts it ([OMP events](https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md#event-surface-current-names-and-behavior), [message delivery](https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md#message-delivery-semantics)). Tmux supplies the desktop terminal, not a command interface for the bot. Neither `omp acp` nor `omp collab list` attaches an ACP client to an uninstrumented TUI; see [the attachment distinction](acp-attachment.md).
+
+**[PROPOSAL] One Zulip topic per registered OMP session.** The topic shows host/project, useful phase changes, a question needing an answer, a short result or artifact link, and `online/busy/idle/offline` state. It should not dump token streams, raw tool output or secrets. Follow active topics on mobile; @mention the human only for blockers. Zulip supports [topics](https://zulip.com/help/introduction-to-topics), [followed-topic notifications](https://zulip.com/help/follow-a-topic) and [mobile notifications](https://zulip.com/help/mobile-notifications). Keep the binding `sessionId ↔ (channelId, topic)` in the bridge; a TUI `/resume` or branch must explicitly change that binding rather than silently sending an old topic to a different conversation ([OMP session lifecycle](https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md#session-lifecycle)).
+
+**[PROPOSAL] Reply and receipt:** Authorize the Zulip sender, ignore bot-originated messages, deduplicate on message ID, and default to a queued follow-up. An explicit action may steer or stop. Distinguish `seen in Zulip`, `submitted to OMP`, and `agent replied`. If the laptop sleeps, Zulip retains the reply but the agent cannot run: show offline, not a false delivery receipt. On recovery, reconcile with Zulip message history; a submission interrupted before acknowledgment is **uncertain** and must not be blindly repeated ([message events](https://zulip.com/api/get-events#message), [queue expiry](https://zulip.com/api/register-queue), [message history](https://zulip.com/api/get-messages)).
+
+**Not every question is chat-answerable:** A normal textual question after a turn can take a follow-up. A native blocking TUI dialog needs a distinct input path. OMP's `tool_approval_requested` event is **observational**, not a remote-approval method; a plain Zulip `yes` must not authorize a pending shell operation. Phone approval needs an explicit request ID, exact action, authorized responder and expiry at a supported approval seam ([OMP tool lifecycle](https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md#tool-lifecycle), [approval policy](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md)).
+
+For one awake laptop, this **local** bridge suffices. A centrally hosted coordinator becomes useful later for multiple machines or durable cross-host routing. OMP keeps the full model history; Zulip is its readable operator conversation. [Buzz's routing model](buzz-pattern.md) informs the interaction without replacing Zulip.
