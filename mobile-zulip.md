@@ -1,6 +1,6 @@
 # Mirror the same tmux session into Zulip; do not move the agent into chat
 
-The operator starts several interactive OMP TUIs at the desk, then wants to read their progress and answer **those same agents** from a phone. A separate chat agent with another conversation would not meet this requirement.
+The operator runs several interactive OMP TUIs in tmux—launched manually or by a local supervisor—then wants to read their progress and answer **those same agents** from a phone. A separate chat agent with another conversation would not meet this requirement.
 
 **[PROPOSAL] Local-first topology:**
 
@@ -18,4 +18,4 @@ The bot receives Zulip messages by outbound long polling and sends replies by HT
 
 **Not every question is chat-answerable:** A normal textual question after a turn can take a follow-up. A native blocking TUI dialog needs a distinct input path. OMP's `tool_approval_requested` event is **observational**, not a remote-approval method; a plain Zulip `yes` must not authorize a pending shell operation. Phone approval needs an explicit request ID, exact action, authorized responder and expiry at a supported approval seam ([OMP tool lifecycle](https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md#tool-lifecycle), [approval policy](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md)).
 
-For one awake laptop, this **local** bridge suffices. A centrally hosted coordinator becomes useful later for multiple machines or durable cross-host routing. OMP keeps the full model history; Zulip is its readable operator conversation. [Buzz's routing model](buzz-pattern.md) informs the interaction without replacing Zulip.
+For one awake laptop, this **local** bridge suffices. A centrally hosted coordinator becomes useful later for multiple machines or durable cross-host routing. OMP keeps the full model history; Zulip is its readable operator conversation. [Buzz's routing model](buzz-pattern.md) informs the interaction without replacing Zulip. [ACP versus Collab](acp-collab-modes.md) explains how to automate the host while keeping its native OMP UI joinable.
