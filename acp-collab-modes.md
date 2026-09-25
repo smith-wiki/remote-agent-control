@@ -1,52 +1,81 @@
-# ACP owns a headless process; Collab owns an interactive host
+# One interactive OMP fleet for Collab and Zulip
 
-**Architectural conclusion:** stock OMP does not expose one ACP-owned session through Collab. If occasional native OMP UI matters, make an interactive OMP process the sole host and attach with Collab. If ACP owns the process, use an ACP client UI; `omp join` cannot join that process without a new ACP-to-Collab hosting path.
+**Decision:** run every agent as an ordinary interactive OMP host, whether a person or a launcher starts it. The host remains the sole owner of its live `AgentSession`; native OMP access uses Collab, while Zulip reaches that same in-process session through a global extension and local IPC. Do not maintain a separate chat-only ACP fleet.
 
-## Automated ACP launch and ownership
+## What stock OMP provides
 
-The controller launches OMP as a child with piped protocol streams:
+**[VERIFIED] Extension loading.** OMP discovers `.ts`/`.js` extensions at startup from the active user agent directory (normally `~/.omp/agent/extensions`) and from the project; with `--profile`, the user directory is profile-specific. A user `config.yml` can also list absolute `extensions` paths. `--no-extensions` disables ambient discovery, so every fleet launch must use the same profile/config and must not use that flag ([loading roots](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/extension-loading.md#L35-L45), [configured paths](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/extension-loading.md#L68-L83), [disable semantics](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/extension-loading.md#L101-L110)). This is startup loading, not attachment to an already-running process.
 
-```text
-argv: ["omp", "acp", "--config", "/absolute/path/acp.yml"]
-# equivalent mode selection: omp --mode acp
-stdio: [pipe, pipe, inherit]
-```
+**[VERIFIED] In-process control.** After the extension runtime is initialized, handlers receive the current read-only session manager; `ctx.sessionManager.getSessionId()` returns the active session ID. Extensions can observe `session_start`, switch and branch events, and `session_shutdown`. `pi.sendUserMessage()` enters OMP's normal prompt flow: it starts a turn when idle, defaults to a steer while streaming, or can use `deliverAs: "followUp"` to wait for the current run ([lifecycle types](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/extensibility/extensions/types.ts#L1261-L1281), [event meanings](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/extensibility/shared-events.ts#L27-L69), [message semantics](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/extensions.md#L215-L223), [session ID](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/session/session-manager.ts#L2537-L2547)). Extensions run inside the host without isolation, so the bridge must be small, authenticated, and failure-contained ([runtime model](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/extension-loading.md#L284-L290)).
 
-`omp acp` forces `mode: "acp"` and serves newline-delimited JSON-RPC on stdin/stdout until its peer disconnects; stderr remains diagnostic output ([command](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/commands/acp.ts#L1-L33), [OMP transport](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-mode.ts#L73-L96), [ACP stdio contract](https://agentclientprotocol.com/protocol/v1/transports#stdio)). The client sends `initialize`, authenticates if needed, then `session/new` with an absolute `cwd` or supported `session/load`; turns use `session/prompt`, streamed `session/update`, permission/elicitation calls, and a final response ([ACP initialization](https://agentclientprotocol.com/protocol/v1/initialization), [sessions](https://agentclientprotocol.com/protocol/v1/session-setup), [turns](https://agentclientprotocol.com/protocol/v1/prompt-turn)). OMP owns those live sessions inside that ACP connection and disposes them when it closes ([implementation](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-agent.ts#L616-L715), [teardown](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-agent.ts#L2773-L2824)).
+**[VERIFIED] Native Collab access.** `collab.autoStart: control` makes each interactive session a Collab host. Collab assigns a random process-stable `instanceId`, increments `generation` for replacement rooms, and binds the published snapshot to one `sessionId` ([controller identity](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/controller.ts#L36-L69), [registry snapshot](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/registry.ts#L65-L101)). A switch stops and withdraws the old room before starting its successor; a link request names the observed generation and returns `stale_generation` after rotation ([rotation](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/controller.ts#L252-L285), [fence](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/registry.ts#L317-L361)).
 
-`session/load` is **not live attachment** to another OMP process. OMP reuses a record only if it is already in this ACP agent's map; otherwise it creates a new `AgentSession` and switches it to the stored path ([load path](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-agent.ts#L1250-L1339)). Loading a file still owned elsewhere creates a second live owner, not another view.
+The local Collab registry is discovery, not a prompt API. It exposes authenticated `snapshot` and generation-bound `link` operations; publication appears only after relay connection succeeds, stopped hosts disappear immediately, and dead metadata is pruned on listing ([publication](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/host.ts#L469-L580), [listing](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/registry.ts#L615-L703)). Thus “listed” means a live local Collab endpoint; `busy` is separate from online, and absence means stopped, dead, or unreachable.
 
-## Collab support by launch mode
+## Uniform launch and registration
 
-| Launch | Verified behavior |
-| --- | --- |
-| Ordinary interactive `omp` | Builds `InteractiveMode` and `CollabController`; `collab.autoStart: view|control` can publish the live session. |
-| `omp join <link>` | Requires a TTY, starts an interactive guest, and invokes `/join` with a link already issued by a Collab host. It neither discovers nor converts an ACP session ([source](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/commands/join.ts#L1-L39)). |
-| `omp acp` / `--mode acp` | Takes the protocol branch before interactive construction; no Collab controller, registry publication, or link is created ([classification](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/main.ts#L1777-L1790), [dispatch](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/main.ts#L2174-L2189)). |
-| print, JSON, RPC, RPC-UI | Non-interactive; no Collab auto-start path. |
-
-The seam is `InteractiveModeContext`: Collab hosting depends on it, and auto-start runs only during interactive initialization ([controller](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/collab/controller.ts#L1-L87), [startup](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/main.ts#L627-L696)). `/collab` has a TUI handler, not an ACP-mode host command ([Collab handler](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/slash-commands/builtin-collaboration.ts#L294-L419), [ACP command filter](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/slash-commands/acp-builtins.ts#L39-L66)). Setting `collab.autoStart` does nothing for a stock ACP process.
-
-## Two designs that keep one live session
-
-1. **[PROPOSAL] Interactive host in tmux — use this for native OMP UI.** Start `omp --cwd <repo> --config <collab.yml>` in a detached pane with `collab.autoStart: control`; discover it via `omp collab list --json`, obtain a generation-bound capability via `omp collab link <instanceId> --json`, then occasionally run `omp join <link>`. The Zulip bridge runs as an in-process extension or authenticated Collab guest. The tmux process remains the only agent/session-file writer; serialize bridge and human prompts if only one input principal may act ([auto-start and registry](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md#sharing-every-session-automatically), [guest powers](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md#guest-permission-model)).
-
-2. **[PROPOSAL] ACP-owned headless process — use an ACP UI.** The coordinator owns the `omp acp` child, fans its one event stream to desktop/web/Zulip views, and routes all prompts through the same ACP connection and session ID. Its client must handle permission and form-elicitation requests rather than silently approving them ([OMP ACP approvals](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md#acp-sessions)). A second `omp`/ACP process using `session/load` is not attachment. Native `omp join` would require new OMP code to host each ACP managed session, publish and rotate Collab links, and arbitrate ACP-client versus guest prompts against that same session; this is not a supported combination today.
-
-For the interactive-first option, a per-process `--config` overlay avoids auto-sharing unrelated OMP sessions ([OMP launch flags](https://github.com/can1357/oh-my-pi/blob/main/docs/cli-reference.md#session-and-workspace), [Collab setting](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md#sharing-every-session-automatically)):
+**[PROPOSAL]** Install one bridge extension and Collab policy in the user profile shared by manual and automated launches (the default profile is shown; existing custom profiles need the same configuration):
 
 ```yaml
-# /absolute/collab.yml
+# ~/.omp/agent/config.yml
+extensions:
+  - /absolute/path/zulip-bridge.ts
 collab:
   autoStart: control
 ```
 
+Both the operator and automation run the same interactive bootstrap, with a PTY (for example, a normal terminal or tmux):
+
 ```sh
-tmux new-session -d -s agent-123 'omp --cwd /absolute/project --config /absolute/collab.yml'
+omp --cwd /absolute/project
 ```
 
-**[PROPOSAL] Exclusive handoff, not simultaneous access:** After the ACP turn settles, close its client/process and open the persisted session with interactive `omp --resume <sessionId>`; that interactive owner can then auto-host Collab. For the reverse direction, stop the TUI before a new ACP client uses `session/load` with the same workspace, profile and session directory. OMP persists a newly created ACP session and supports CLI resume, but this restores **saved history**, not a live in-flight process ([ACP persistence](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-agent.ts#L1234-L1247), [CLI resume](https://github.com/can1357/oh-my-pi/blob/main/docs/cli-reference.md#session-history), [ACP load](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/acp/acp-agent.ts#L1250-L1327)).
+A request to create a new Zulip topic starts this same command and waits for the session's bridge registration. A manually started host loads the same extension and self-registers; it does not need to have been created by the Zulip service. A manually or automatically launched process is therefore the same kind of agent with the same native Collab and chat capabilities.
 
-## Keys and session rebinding
+An already-running TUI that did not load the extension is **not** attached retroactively. Restart or resume it with the shared profile/configuration to make it register; neither Collab discovery nor `omp acp` injects an extension into an uninstrumented process.
 
-A control link contains the AES-256-GCM room key plus a write token and grants read/prompt/interrupt access; a view link omits the token. Treat either as a secret: possession is the trust boundary ([link security](https://github.com/can1357/oh-my-pi/blob/main/docs/collab.md#link-format)). `/new`, `/resume`, `/fork`, and branch retire the old room and create a new generation; stale-generation link requests fail ([rotation](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/collab/controller.ts#L1-L10), [switch handling](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/collab/controller.ts#L271-L285)). Bind a bridge to `(instanceId, generation, sessionId)`, relist after a switch, and never carry an old topic or capability into the replacement session.
+**Tradeoff:** Even chat-created agents need a terminal/PTY owner and a tmux-style lifecycle; remote hosts or Kubernetes launchers would have to provide that too. This cost buys one native-joinable execution model instead of a second ACP-only class.
+
+## How a Zulip reply reaches the live agent
+
+```text
+Zulip message event
+  -> bot's immutable topic binding
+  -> authenticated local IPC request
+  -> bridge verifies the exact live identity
+  -> pi.sendUserMessage(...)
+  -> the host's one live AgentSession
+
+assistant events
+  -> bridge IPC
+  -> Zulip bot POST /messages
+  -> the same channel/topic
+```
+
+The Zulip side can consume message events through Zulip's official real-time events API and post replies with `POST /messages` ([events](https://zulip.com/api/real-time-events), [send message](https://zulip.com/api/send-message)).
+
+The local part is application code, not an OMP built-in:
+
+1. **[PROPOSAL] Explicit identity.** At process startup the extension creates a random `hostInstanceId`. Each active session registration has a monotonically increasing `generation` and the immutable `sessionId` read from the current handler context. The route key is the exact triple `(hostInstanceId, generation, sessionId)`. These are bridge identities; do not pretend they are the Collab controller's separately owned `instanceId` and `generation`.
+2. **[PROPOSAL] Online registration.** On `session_start`, only when `ctx.mode === "tui"`, the extension opens an owner-only Unix socket/named pipe, then atomically publishes `{hostInstanceId, generation, sessionId, pid, cwd, endpoint}` plus a random bearer token in a bridge-owned registry—not OMP's Collab registry. Publish only after the endpoint is listening. On graceful `session_shutdown`, withdraw the record and close the endpoint. A crash may leave metadata, but the dead endpoint is offline and the bot prunes the unreachable record rather than treating it as idle.
+3. **[PROPOSAL] Session-switch fence.** On `session_switch` and `session_branch`, withdraw the old record, increment `generation`, read the new `sessionId`, and publish the successor. Every IPC request carries the full expected triple. In one synchronous, no-`await` admission step, the extension compares it with the current triple and current `ctx.sessionManager.getSessionId()` immediately before calling `pi.sendUserMessage`; any mismatch returns `stale_session`. Therefore an old topic can never silently target the session that replaced it, even during the short registry-rotation window. A cancelled switch keeps the old identity because no post-switch event occurred.
+4. **[PROPOSAL] Serialized prompt policy.** Include the Zulip message ID as an idempotency key. When idle, send a normal user message; when busy, use `deliverAs: "followUp"` so a chat reply does not unexpectedly steer an in-flight terminal/Collab turn. Acknowledgement means “admitted to this live identity,” not “the model finished.” Forward assistant/turn events back with the same route key and drop output after that key goes stale.
+5. **[PROPOSAL] Topic binding.** Store the route key in the bot's durable topic mapping. On stale/offline, report that status and require an explicit rebind; never discover “the newest session” and redirect implicitly. The bot never opens or writes OMP session files. The in-process extension is the only Zulip adapter calling the owning session, so there is no second session writer.
+
+**Startup boundary:** [VERIFIED] `session_start` is emitted during interactive initialization, but OMP only marks Collab prompt-ready after optional setup dialogs and transcript replay ([startup order](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/main.ts#L632-L705), [Collab readiness](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/collab.md#L51-L65)). **[PROPOSAL]** A registration initially means `starting`, not prompt-ready; the bot must gate admission until a separate readiness signal. The reviewed extension lifecycle does not document a post-startup-ready event, so this signal needs an explicit launcher/operator handshake or a small OMP host hook; do not infer it from Collab registry presence.
+
+For native access, list the independently managed Collab hosts, request a generation-bound control link, and join it from OMP:
+
+```sh
+omp collab list --json
+omp collab link <instanceId> --json
+omp join '<returned-url>'
+```
+
+The control link is a bearer capability: keep it out of Zulip topic messages and issue it privately when a native guest actually needs access ([guest permissions](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/collab.md#guest-permission-model)). Chat routing uses the extension's separate local identity and never needs this link.
+
+## Why not use a stock headless Collab guest or ACP?
+
+**[VERIFIED]** Stock Collab documents two guest products: interactive `omp join` and the bundled browser client. The internal `CollabGuestLink` requires an `InteractiveModeContext` and restores a replica session for TUI rendering; the reviewed first-party docs expose no supported headless/library/bot guest API ([guest implementation](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/guest.ts#L167-L180), [join path](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/collab/guest.ts#L261-L280), [documented clients](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/docs/collab.md#L1-L27)). A Zulip client built from Collab's wire description would be **custom protocol work**: encryption and capability handling, WebSocket reconnect, snapshot/resynchronization, frame ordering, rotation, errors, and output projection. It is not the default recommendation.
+
+**[VERIFIED]** ACP is a separate stdio JSON-RPC owner. `mode === "acp"` takes its own branch before ordinary interactive construction; native Collab auto-start and `omp join` belong to the interactive branch ([dispatch](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/main.ts#L2180-L2207), [interactive startup](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/main.ts#L570-L703), [ACP transport](https://github.com/can1357/oh-my-pi/blob/ba344f5e69f28535e7e9a2cf09e5af3643861b73/packages/coding-agent/src/modes/acp/acp-mode.ts#L73-L96)). Stock ACP cannot simultaneously be the native-joinable interactive host, and `session/load` is not attachment to another live process. If an ACP client facade is truly required, translating ACP lifecycle, approvals, streaming, cancellation, and session fencing onto this interactive owner is new custom work—not an existing OMP feature or configuration switch.
